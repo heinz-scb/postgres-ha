@@ -197,6 +197,51 @@ struct WatcherConfig {
     /// so the two sightings are always at least one normal poll apart, even
     /// while the watcher runs its tighter pre-first-full cadence.
     half_stanza_confirm: u64,
+    /// Backup stall watchdog — see `run_backup_supervised`.
+    stall: StallConfig,
+}
+
+/// Knobs of the backup stall watchdog. A running backup is killed only when
+/// its reported progress (bytes copied) has not advanced for the stall
+/// window; one that keeps copying is never touched, however long it runs.
+#[derive(Clone, Copy, Debug)]
+struct StallConfig {
+    /// `WAL_BACKUP_STALL_SECONDS` (default 1800 = 30 min; 0 disables the
+    /// watchdog): the floor of the window. It covers the phases in which
+    /// pgBackRest reports no byte progress at all — pg_backup_start
+    /// (start-fast=y: one immediate checkpoint), removing a non-resumable
+    /// earlier attempt from the bucket, building and saving the manifest, and
+    /// the tail after the last progress write (pg_backup_stop plus the
+    /// archive-timeout wait for the closing WAL). Seconds to minutes on a
+    /// healthy cluster; 30 min is an order of magnitude above that while still
+    /// turning an indefinite hang into a retry within the hour.
+    floor_seconds: u64,
+    /// `WAL_BACKUP_STALL_MIN_BYTES_PER_SECOND` (default 4 MiB/s): scales the
+    /// window with the backup's size. pgBackRest stores percent-complete in
+    /// hundredths (100% == 10000); its >10 threshold is >0.10 percentage
+    /// points. Allow 0.11% at this rate, plus the phase floor above.
+    min_bytes_per_second: u64,
+    /// `WAL_BACKUP_STALL_POLL_SECONDS` (default 60): progress probe cadence.
+    poll_seconds: u64,
+    /// `WAL_BACKUP_STALL_KILL_GRACE_SECONDS` (default 60): time between
+    /// SIGTERM (pgBackRest stops its workers and releases its lock) and
+    /// SIGKILL of whatever is still alive.
+    kill_grace_seconds: u64,
+}
+
+impl StallConfig {
+    fn from_env() -> Self {
+        Self {
+            floor_seconds: env_u64("WAL_BACKUP_STALL_SECONDS", 1800),
+            // 0 would divide by zero / spin the probe loop: fall back.
+            min_bytes_per_second: match env_u64("WAL_BACKUP_STALL_MIN_BYTES_PER_SECOND", 4 << 20) {
+                0 => 4 << 20,
+                v => v,
+            },
+            poll_seconds: env_u64("WAL_BACKUP_STALL_POLL_SECONDS", 60).max(1),
+            kill_grace_seconds: env_u64("WAL_BACKUP_STALL_KILL_GRACE_SECONDS", 60),
+        }
+    }
 }
 
 impl WatcherConfig {
@@ -229,6 +274,7 @@ impl WatcherConfig {
                 30,
             ),
             half_stanza_confirm: env_u64("WAL_BACKUP_HALF_STANZA_CONFIRM_SECONDS", poll_interval),
+            stall: StallConfig::from_env(),
         }
     }
 }
@@ -463,7 +509,7 @@ async fn watcher_iteration(data_dir: &str, config: &WatcherConfig, client: &Coor
             info!(reason = %reason, "pgbackrest-watcher: no action");
         }
         Action::Full | Action::Diff => {
-            run_backup(data_dir, action, &stats).await;
+            run_backup(data_dir, config, action, &stats).await;
         }
     }
 }
@@ -799,27 +845,46 @@ fn parse_has_full(info_json: &str) -> Result<bool> {
 /// `None` on timeout (60 s), spawn failure, non-zero exit, or empty output —
 /// callers treat all of those as inconclusive.
 async fn pgbackrest_info_json() -> Option<String> {
-    let out = tokio::time::timeout(
-        Duration::from_secs(60),
-        Command::new("pgbackrest")
-            .args(["--stanza=main", "--repo=1", "info", "--output=json"])
-            .env_remove("PGHOST")
-            .env_remove("PGPORT")
-            .output(),
-    )
+    let mut command = Command::new("pgbackrest");
+    command
+        .args(["--stanza=main", "--repo=1", "info", "--output=json"])
+        .env_remove("PGHOST")
+        .env_remove("PGPORT");
+    bounded_info_output(&mut command, Duration::from_secs(60)).await
+}
+
+/// Drain stdout while waiting, and kill/reap an expired probe explicitly.
+async fn bounded_info_output(command: &mut Command, limit: Duration) -> Option<String> {
+    use std::process::Stdio;
+    use tokio::io::AsyncReadExt;
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let mut read = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).await.map(|_| bytes)
+    });
+    let result = tokio::time::timeout(limit, async {
+        let status = child.wait().await.ok()?;
+        if !status.success() {
+            return None;
+        }
+        let bytes = (&mut read).await.ok()?.ok()?;
+        Some(String::from_utf8_lossy(&bytes).into_owned())
+    })
     .await;
-    let out = match out {
-        Ok(Ok(o)) => o,
-        _ => return None,
-    };
-    if !out.status.success() {
-        return None;
+    match result {
+        Ok(Some(output)) if !output.trim().is_empty() => Some(output),
+        _ => {
+            read.abort();
+            let _ = child.kill().await;
+            None
+        }
     }
-    let info_json = String::from_utf8_lossy(&out.stdout).into_owned();
-    if info_json.trim().is_empty() {
-        return None;
-    }
-    Some(info_json)
 }
 
 /// Probe the S3 catalog for repo1 and classify into the three states above.
@@ -1085,7 +1150,7 @@ async fn log_catalog_probe_error() {
 async fn stanza_create_step(
     data_dir: &str,
     config: &WatcherConfig,
-    client: &reqwest::Client,
+    client: &Coordinator,
     stats: &ArchiverStats,
 ) {
     let state_path = format!("{data_dir}/{STATE_FILENAME}");
@@ -1266,7 +1331,7 @@ fn decide_half_stanza(
 async fn half_created_stanza_step(
     data_dir: &str,
     config: &WatcherConfig,
-    client: &reqwest::Client,
+    client: &Coordinator,
     stats: &ArchiverStats,
     kind: HalfStanzaKind,
 ) {
@@ -2276,7 +2341,7 @@ async fn gap_recovery_step(
             // that actually failed. stats.failed_count is the
             // pre-backup fallback for clear_gap_recovery_state's
             // post-backup refresh.
-            if run_backup(data_dir, Action::Diff, stats).await {
+            if run_backup(data_dir, config, Action::Diff, stats).await {
                 clear_gap_recovery_state(
                     data_dir,
                     "cleared by gap-recovery diff",
@@ -2426,13 +2491,217 @@ fn decide_action(data_dir: &str, config: &WatcherConfig, stats: &ArchiverStats) 
     }
 }
 
+// ---- Backup stall watchdog ------------------------------------------------
+//
+// `pgbackrest backup` has no bound of its own: a backup wedged on a hung
+// bucket connection (or anything else that stops it copying) used to block
+// this loop forever — no further backups, no iteration lines, while
+// archive-push kept working, so the only visible symptom was a catalog whose
+// newest backup kept ageing. The backup now runs as a child supervised by
+// PROGRESS, never by wall clock: a multi-TB full legitimately runs for hours.
+//
+// Progress source: `pgbackrest info --output=json` reports a running backup's
+// progress under the stanza's `status.lock.backup` — `held` (a valid backup
+// lock exists on this host), `size` (total bytes) and `size-cplt` (bytes
+// copied so far), the latter two only once the copy phase has started
+// (pgBackRest >= 2.38; src/command/info/info.c, stanzaStatusBackupLockAdd:
+// STATUS_KEY_LOCK_HELD_VAR "held", STATUS_KEY_LOCK_SIZE_VAR "size",
+// STATUS_KEY_LOCK_SIZE_COMPLETE_VAR "size-cplt" — unchanged in 2.59.0). The
+// lock is read from this host's lock-path, which is where the child runs.
+
+/// One observation of the running backup's progress. Any change between two
+/// observations counts as progress (lock taken, copy phase started, bytes
+/// copied).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BackupProgress {
+    held: bool,
+    size_complete: Option<u64>,
+    size: Option<u64>,
+}
+
+/// Extract `status.lock.backup` of stanza `main` from `pgbackrest info
+/// --output=json`. `None` when the JSON is unparseable or carries no lock
+/// object — callers treat that as an inconclusive probe.
+fn parse_backup_progress(info_json: &str) -> Option<BackupProgress> {
+    let v: serde_json::Value = serde_json::from_str(info_json).ok()?;
+    let stanza = v
+        .as_array()?
+        .iter()
+        .find(|s| s.get("name").and_then(|n| n.as_str()) == Some("main"))?;
+    let lock = stanza.get("status")?.get("lock")?.get("backup")?;
+    if !lock.is_object() {
+        return None;
+    }
+    Some(BackupProgress {
+        held: lock.get("held").and_then(|h| h.as_bool()).unwrap_or(false),
+        size_complete: lock.get("size-cplt").and_then(|s| s.as_u64()),
+        size: lock.get("size").and_then(|s| s.as_u64()),
+    })
+}
+
+/// Effective stall window for a backup of `size` bytes (0 = not reported
+/// yet): max(floor, 0.11 % of size / min rate). See `StallConfig`.
+fn backup_stall_window(size: u64, cfg: &StallConfig) -> u64 {
+    let scaled = size / 10_000 * 11 / cfg.min_bytes_per_second.max(1);
+    scaled.max(cfg.floor_seconds)
+}
+
+/// Pure stall bookkeeping: feed it every probe result, ask it whether the
+/// backup has stalled. An inconclusive probe resets the observation window.
+#[derive(Debug)]
+struct StallTracker {
+    last: Option<BackupProgress>,
+    last_progress_at: i64,
+}
+
+impl StallTracker {
+    fn new(started_at: i64) -> Self {
+        Self {
+            last: None,
+            last_progress_at: started_at,
+        }
+    }
+
+    fn observe(&mut self, now: i64, probe: Option<BackupProgress>) {
+        if let Some(p) = probe {
+            if self.last != Some(p) {
+                self.last = Some(p);
+                self.last_progress_at = now;
+            }
+        } else {
+            // Telemetry failure is not evidence that the backup stopped.
+            // Require a full fresh window after observations resume.
+            self.last = None;
+            self.last_progress_at = now;
+        }
+    }
+
+    fn size(&self) -> u64 {
+        self.last.and_then(|p| p.size).unwrap_or(0)
+    }
+
+    fn stalled_for(&self, now: i64) -> u64 {
+        (now - self.last_progress_at).max(0) as u64
+    }
+
+    fn is_stalled(&self, now: i64, cfg: &StallConfig) -> bool {
+        self.last.is_some()
+            && cfg.floor_seconds > 0
+            && self.stalled_for(now) >= backup_stall_window(self.size(), cfg)
+    }
+}
+
+/// Every descendant PID of `pid`, depth-first, via `pgrep -P` (procps is in
+/// the image; the watcher already relies on pgrep/pkill).
+async fn descendant_pids(pid: u32) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut stack = vec![pid];
+    while let Some(p) = stack.pop() {
+        let Ok(o) = Command::new("pgrep")
+            .args(["-P", &p.to_string()])
+            .output()
+            .await
+        else {
+            continue;
+        };
+        for child in String::from_utf8_lossy(&o.stdout)
+            .split_whitespace()
+            .filter_map(|s| s.parse::<u32>().ok())
+        {
+            out.push(child);
+            stack.push(child);
+        }
+    }
+    out
+}
+
+fn send_signal(pid: u32, sig: nix::sys::signal::Signal) {
+    let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), sig);
+}
+
+/// SIGTERM the backup (pgBackRest stops its local workers and releases the
+/// stanza lock itself), wait up to the grace period, then SIGKILL whatever of
+/// the process tree is still alive. Descendants are snapshotted first: once
+/// the parent dies they are reparented and can no longer be found through
+/// it. The partial backup left in the repo is pgBackRest's to handle — the
+/// next full resumes it, the next diff/incr discards it.
+async fn kill_process_tree(child: &mut tokio::process::Child, grace: Duration) {
+    use nix::sys::signal::Signal;
+    let Some(pid) = child.id() else {
+        return;
+    };
+    let tree = descendant_pids(pid).await;
+    send_signal(pid, Signal::SIGTERM);
+    if tokio::time::timeout(grace, child.wait()).await.is_err() {
+        let _ = child.start_kill();
+    }
+    for p in tree {
+        send_signal(p, Signal::SIGKILL);
+    }
+}
+
+/// Run `pgbackrest backup --type=<type>` under the stall watchdog and return
+/// its exit status (a signal status when the watchdog killed it). A backup
+/// whose progress keeps moving runs to completion exactly as an unsupervised
+/// call would; `WAL_BACKUP_STALL_SECONDS=0` turns supervision off.
+async fn run_backup_supervised(
+    backup_type: &str,
+    cfg: &StallConfig,
+) -> std::io::Result<std::process::ExitStatus> {
+    let mut child = Command::new("pgbackrest")
+        .args([
+            "--stanza=main",
+            "backup",
+            &format!("--type={backup_type}"),
+            "--no-expire-auto",
+        ])
+        .env_remove("PGHOST")
+        .env_remove("PGPORT")
+        .spawn()?;
+    if cfg.floor_seconds == 0 {
+        return child.wait().await;
+    }
+    let mut tracker = StallTracker::new(now_epoch());
+    loop {
+        tokio::select! {
+            status = child.wait() => return status,
+            _ = tokio::time::sleep(Duration::from_secs(cfg.poll_seconds)) => {}
+        }
+        let probe = pgbackrest_info_json()
+            .await
+            .and_then(|j| parse_backup_progress(&j));
+        let now = now_epoch();
+        tracker.observe(now, probe);
+        if tracker.is_stalled(now, cfg) {
+            // Exited while the probe ran: nothing to kill.
+            if let Some(status) = child.try_wait()? {
+                return Ok(status);
+            }
+            warn!(
+                backup_type = %backup_type,
+                window_seconds = backup_stall_window(tracker.size(), cfg),
+                last_progress = ?tracker.last,
+                "pgbackrest-watcher: backup stalled: no progress for {}s; killed",
+                tracker.stalled_for(now)
+            );
+            kill_process_tree(&mut child, Duration::from_secs(cfg.kill_grace_seconds)).await;
+            return child.wait().await;
+        }
+    }
+}
+
 /// Run `pgbackrest backup --type=<type>` and apply the post-success
 /// bookkeeping (state-file timestamps, gap-recovery state clear on a
 /// full, PITR anchor emit). Returns `true` if the backup succeeded so
 /// callers can branch on the actual exit code rather than guessing from
 /// `last_diff_at` proxies that could match an unrelated periodic diff
 /// completed seconds earlier.
-async fn run_backup(data_dir: &str, action: Action, stats_pre: &ArchiverStats) -> bool {
+async fn run_backup(
+    data_dir: &str,
+    config: &WatcherConfig,
+    action: Action,
+    stats_pre: &ArchiverStats,
+) -> bool {
     let backup_type = match action {
         Action::Full => "full",
         Action::Diff => "diff",
@@ -2452,17 +2721,7 @@ async fn run_backup(data_dir: &str, action: Action, stats_pre: &ArchiverStats) -
     // own explicit, non-gating step below, only after the backup is
     // confirmed to have actually succeeded. Mirrors postgres-ssl's
     // `pgbackrest-backup-watcher.sh` fix.
-    let mut res = Command::new("pgbackrest")
-        .args([
-            "--stanza=main",
-            "backup",
-            &format!("--type={backup_type}"),
-            "--no-expire-auto",
-        ])
-        .env_remove("PGHOST")
-        .env_remove("PGPORT")
-        .status()
-        .await;
+    let mut res = run_backup_supervised(backup_type, &config.stall).await;
 
     // Exit 55 = FileMissingError: backup.info absent — stanza was never
     // initialized (bootstrap stanza-create failed or timed out on first
@@ -2481,17 +2740,7 @@ async fn run_backup(data_dir: &str, action: Action, stats_pre: &ArchiverStats) -
             Ok(s) => warn!(status = ?s, "pgbackrest-watcher: stanza-create failed"),
             Err(e) => warn!(error = %e, "pgbackrest-watcher: stanza-create invocation failed"),
         }
-        res = Command::new("pgbackrest")
-            .args([
-                "--stanza=main",
-                "backup",
-                &format!("--type={backup_type}"),
-                "--no-expire-auto",
-            ])
-            .env_remove("PGHOST")
-            .env_remove("PGPORT")
-            .status()
-            .await;
+        res = run_backup_supervised(backup_type, &config.stall).await;
     }
 
     match res {
@@ -2564,7 +2813,9 @@ async fn run_backup(data_dir: &str, action: Action, stats_pre: &ArchiverStats) -
         Ok(s) => {
             // Record failure time only for fulls so decide_action can space
             // failing-full retries (full_retry_backoff) without hammering S3
-            // every poll. Diffs aren't gated.
+            // every poll. Diffs aren't gated. A backup the stall watchdog
+            // killed lands here like any other failure: same marker, same
+            // backoff, and the loop carries on.
             if backup_type == "full" {
                 let state_path = format!("{data_dir}/{STATE_FILENAME}");
                 let _ = write_state_field(
@@ -3810,5 +4061,251 @@ P00   INFO: stanza-create command end: aborted with exception [055]\n";
             read_state_field(&path, "wal_regression_orig_path").as_deref(),
             Some("/pgbackrest/cluster-1")
         );
+    }
+}
+
+#[cfg(test)]
+mod stall_tests {
+    use super::{
+        backup_stall_window, kill_process_tree, parse_backup_progress, BackupProgress, StallConfig,
+        StallTracker,
+    };
+    use std::time::Duration;
+
+    const GIB: u64 = 1 << 30;
+
+    fn cfg() -> StallConfig {
+        StallConfig {
+            floor_seconds: 1800,
+            min_bytes_per_second: 4 << 20,
+            poll_seconds: 60,
+            kill_grace_seconds: 60,
+        }
+    }
+
+    /// `pgbackrest info --output=json` shape for a stanza with a running
+    /// backup, as emitted by pgBackRest 2.59 (`status.lock.backup`).
+    fn info_json(lock_backup: &str) -> String {
+        format!(
+            r#"[{{"name":"main","status":{{"code":0,"message":"ok","lock":{{"backup":{lock_backup},"restore":{{"held":false}}}}}},"backup":[]}}]"#
+        )
+    }
+
+    fn copying(done: u64, size: u64) -> Option<BackupProgress> {
+        Some(BackupProgress {
+            held: true,
+            size_complete: Some(done),
+            size: Some(size),
+        })
+    }
+
+    #[test]
+    fn parse_progress_during_copy() {
+        let j = info_json(
+            r#"{"held":true,"size-cplt":1234,"size":5678,"repo":[{"key":1,"size":5678,"size-cplt":1234}]}"#,
+        );
+        assert_eq!(parse_backup_progress(&j), copying(1234, 5678));
+    }
+
+    #[test]
+    fn parse_progress_before_copy_phase() {
+        let j = info_json(r#"{"held":true}"#);
+        assert_eq!(
+            parse_backup_progress(&j),
+            Some(BackupProgress {
+                held: true,
+                size_complete: None,
+                size: None
+            })
+        );
+    }
+
+    #[test]
+    fn parse_progress_no_backup_running() {
+        let j = info_json(r#"{"held":false}"#);
+        assert_eq!(
+            parse_backup_progress(&j),
+            Some(BackupProgress {
+                held: false,
+                size_complete: None,
+                size: None
+            })
+        );
+    }
+
+    #[test]
+    fn parse_progress_inconclusive() {
+        assert_eq!(parse_backup_progress("not json"), None);
+        assert_eq!(parse_backup_progress("[]"), None);
+        assert_eq!(
+            parse_backup_progress(r#"[{"name":"main","status":{"code":0}}]"#),
+            None
+        );
+        assert_eq!(
+            parse_backup_progress(&info_json(r#"{"held":true}"#).replace("\"main\"", "\"other\"")),
+            None
+        );
+    }
+
+    #[test]
+    fn window_is_floor_until_size_known_then_scales() {
+        let c = cfg();
+        assert_eq!(backup_stall_window(0, &c), 1800);
+        // Progress granularity is 0.11%, so ordinary backups keep the floor.
+        assert_eq!(backup_stall_window(112 * GIB, &c), 1800);
+        // A stalled 1 TiB backup must not wait eight hours.
+        assert_eq!(backup_stall_window(1024 * GIB, &c), 1800);
+        assert_eq!(backup_stall_window(100 * 1024 * GIB, &c), 28835);
+        // Small backups keep the floor.
+        assert_eq!(backup_stall_window(GIB, &c), 1800);
+    }
+
+    #[test]
+    fn frozen_progress_is_a_stall_after_the_window() {
+        let c = cfg();
+        let frozen = copying(10 * GIB, 100 * GIB);
+        let window = backup_stall_window(100 * GIB, &c) as i64;
+        let mut t = StallTracker::new(0);
+        t.observe(60, frozen);
+        let mut now = 60;
+        while now + 60 < 60 + window {
+            now += 60;
+            t.observe(now, frozen);
+            assert!(!t.is_stalled(now, &c), "stalled too early at {now}");
+        }
+        now = 60 + window;
+        t.observe(now, frozen);
+        assert!(t.is_stalled(now, &c));
+        assert_eq!(t.stalled_for(now), window as u64);
+    }
+
+    #[test]
+    fn hang_before_copy_phase_is_a_stall_after_the_floor() {
+        // The observed failure shape: the backup takes its lock and never
+        // reaches the copy phase, so no size is ever reported.
+        let c = cfg();
+        let held = Some(BackupProgress {
+            held: true,
+            size_complete: None,
+            size: None,
+        });
+        let mut t = StallTracker::new(0);
+        t.observe(60, held);
+        t.observe(1799, held);
+        assert!(!t.is_stalled(1799, &c));
+        t.observe(1860, held);
+        assert!(t.is_stalled(1860, &c));
+    }
+
+    #[test]
+    fn progressing_backup_is_never_a_stall() {
+        // A 2 TiB full copying at a slow 5 MiB/s, observed every minute for
+        // ~5 days: reported bytes move in ~0.11 % steps,
+        // yet it is never cut.
+        let c = cfg();
+        let size = 2048 * GIB;
+        let rate = 5u64 << 20;
+        let step = size / 10_000 * 11;
+        let mut t = StallTracker::new(0);
+        let mut now = 0i64;
+        while (now as u64) * rate < size {
+            now += 60;
+            let reported = ((now as u64) * rate).min(size) / step * step;
+            t.observe(now, copying(reported, size));
+            assert!(!t.is_stalled(now, &c), "cut a progressing backup at {now}s");
+        }
+    }
+
+    #[test]
+    fn failed_probes_reset_the_observation_window() {
+        let c = cfg();
+        let mut t = StallTracker::new(0);
+        t.observe(60, copying(1, 10));
+        for now in (120..=1860).step_by(60) {
+            t.observe(now, None);
+        }
+        assert!(!t.is_stalled(1860, &c));
+        t.observe(1920, copying(1, 10));
+        assert!(!t.is_stalled(3719, &c));
+        t.observe(3720, copying(1, 10));
+        assert!(t.is_stalled(3720, &c));
+    }
+
+    #[tokio::test]
+    async fn expired_info_probe_is_killed_and_reaped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pidfile = tmp.path().join("pid");
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .args(["-c", "echo $$ > \"$1\"; exec sleep 30", "probe"])
+            .arg(&pidfile);
+        assert!(
+            super::bounded_info_output(&mut command, Duration::from_millis(300))
+                .await
+                .is_none()
+        );
+        let pid: u32 = std::fs::read_to_string(pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(!alive(pid), "expired info process survived timeout");
+    }
+
+    #[test]
+    fn floor_zero_disables_the_watchdog() {
+        let c = StallConfig {
+            floor_seconds: 0,
+            ..cfg()
+        };
+        let mut t = StallTracker::new(0);
+        t.observe(60, copying(1, 10));
+        assert!(!t.is_stalled(10_000_000, &c));
+    }
+
+    fn alive(pid: u32) -> bool {
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok()
+    }
+
+    #[tokio::test]
+    async fn kill_process_tree_escalates_and_reaps_children() {
+        // A child that ignores SIGTERM and has a child of its own — the worst
+        // case of a wedged pgbackrest with local worker processes.
+        let dir = tempfile::tempdir().unwrap();
+        let gc_file = dir.path().join("grandchild.pid");
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "trap '' TERM; sleep 300 & echo $! > {}; wait",
+                gc_file.display()
+            ))
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        let mut grandchild = None;
+        for _ in 0..100 {
+            if let Ok(s) = std::fs::read_to_string(&gc_file) {
+                if let Ok(p) = s.trim().parse::<u32>() {
+                    grandchild = Some(p);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let grandchild = grandchild.expect("grandchild pid");
+        assert!(alive(grandchild));
+
+        kill_process_tree(&mut child, Duration::from_secs(1)).await;
+        let status = child.wait().await.unwrap();
+        assert!(!status.success());
+        assert!(!alive(pid));
+        // The reparented grandchild is reaped by init; give it a moment.
+        for _ in 0..100 {
+            if !alive(grandchild) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!alive(grandchild), "grandchild survived the kill");
     }
 }
